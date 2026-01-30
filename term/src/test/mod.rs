@@ -1373,3 +1373,208 @@ fn test_hyperlinks() {
         Compare::TEXT | Compare::ATTRS,
     );
 }
+
+#[test]
+fn test_set_mark_clear_to_mark_basic() {
+    // Test basic SetMark + ClearToMark functionality
+    let mut term = TestTerm::new(5, 10, 0);
+
+    // Print some content
+    term.print("Before");
+    // Set a mark
+    term.print("\x1b]1337;SetMark\x07");
+    // Print more content that should be cleared
+    term.print("After mark");
+
+    // Verify content before clearing
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["BeforeAfte", "r mark", "", "", ""],
+    );
+
+    // Clear to mark
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // After clearing, only "Before" should remain
+    // The first line's trailing blanks are pruned, while new lines have full width
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &[
+            "Before",
+            "          ",
+            "          ",
+            "          ",
+            "          ",
+        ],
+    );
+}
+
+#[test]
+fn test_set_mark_with_newlines() {
+    // Test SetMark with newlines in content
+    let mut term = TestTerm::new(5, 10, 10);
+
+    term.print("Line 1\r\n");
+    term.print("\x1b]1337;SetMark\x07");
+    term.print("Line 2\r\n");
+    term.print("Line 3\r\n");
+
+    // Clear to mark
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Only "Line 1" should remain (mark was set at start of line 2)
+    // The bookmark is at column 0 of row 2, so "Line 1" is preserved and
+    // the rest is cleared. The first line keeps its trailing blanks pruned.
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &[
+            "Line 1",
+            "          ",
+            "          ",
+            "          ",
+            "          ",
+        ],
+    );
+}
+
+#[test]
+fn test_clear_to_mark_without_mark() {
+    // Test ClearToMark without setting a mark (should be no-op)
+    let mut term = TestTerm::new(5, 10, 0);
+
+    term.print("Content");
+
+    // ClearToMark without setting mark should be no-op
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Content should be unchanged
+    assert_visible_contents(&term, file!(), line!(), &["Content", "", "", "", ""]);
+}
+
+#[test]
+fn test_set_mark_replacement() {
+    // Test that setting a new mark replaces the old one
+    let mut term = TestTerm::new(5, 10, 0);
+
+    term.print("A");
+    term.print("\x1b]1337;SetMark\x07"); // First mark at column 1 (after 'A')
+    term.print("B");
+    term.print("\x1b]1337;SetMark\x07"); // Second mark replaces first, at column 2 (after 'AB')
+    term.print("C");
+
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Should clear from second mark (at column 2), so 'AB' remains
+    // Trailing blanks are pruned from the first line
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["AB", "          ", "          ", "          ", "          "],
+    );
+}
+
+#[test]
+fn test_set_mark_with_scrollback() {
+    // Test SetMark when content scrolls into scrollback
+    let mut term = TestTerm::new(3, 10, 10);
+
+    term.print("Line 1\r\n");
+    term.print("\x1b]1337;SetMark\x07");
+    term.print("Line 2\r\n");
+    term.print("Line 3\r\n");
+    term.print("Line 4\r\n");
+    term.print("Line 5\r\n");
+
+    // At this point, "Line 1" has scrolled into scrollback
+    // But the mark was set at "Line 2" which may or may not be in view
+
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Should clear from mark position, keeping "Line 1"
+    // Trailing blanks are pruned from the first line
+    assert_all_contents(
+        &term,
+        file!(),
+        line!(),
+        &["Line 1", "          ", "          "],
+    );
+}
+
+#[test]
+fn test_clear_to_mark_preserves_scrollback() {
+    // Test that scrollback content BEFORE the mark is preserved after ClearToMark
+    // Use a small visible area (3 rows) with larger scrollback (20 lines)
+    let mut term = TestTerm::new(3, 15, 20);
+
+    // Create scrollback content (lines 1-10 will eventually scroll into scrollback)
+    for i in 1..=10 {
+        term.print(&format!("Scrollback {}\r\n", i));
+    }
+
+    // Set a mark after the scrollback content
+    // After printing 10 lines + newlines, cursor is at column 0 of a new line (phys line 10)
+    term.print("\x1b]1337;SetMark\x07");
+
+    // Add more content after the mark (this will be cleared)
+    term.print("After mark 1\r\n");
+    term.print("After mark 2\r\n");
+    term.print("After mark 3\r\n");
+
+    // Clear to mark - should preserve all scrollback lines 1-10
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Verify all scrollback content is preserved
+    // The mark was set at the beginning of phys line 10 (after "Scrollback 10\r\n")
+    // After clearing:
+    // - Lines 0-9 contain "Scrollback 1-10" (preserved)
+    // - Line 10 is blank (cleared from column 0)
+    // - Total: 11 lines (8 scrollback + 3 visible)
+    // - Visible area shows lines 8-10: "Scrollback 9", "Scrollback 10", blank
+    assert_all_contents(
+        &term,
+        file!(),
+        line!(),
+        &[
+            "Scrollback 1",
+            "Scrollback 2",
+            "Scrollback 3",
+            "Scrollback 4",
+            "Scrollback 5",
+            "Scrollback 6",
+            "Scrollback 7",
+            "Scrollback 8",
+            "Scrollback 9",
+            "Scrollback 10",
+            "               ", // line where mark was set, cleared from col 0
+        ],
+    );
+}
+
+#[test]
+fn test_cursor_position_after_clear_to_mark() {
+    // Test that cursor is positioned at the bookmark location after ClearToMark
+    let mut term = TestTerm::new(5, 10, 0);
+
+    term.print("Before");
+    term.print("\x1b]1337;SetMark\x07"); // Mark at column 6 (after "Before")
+    term.print("After");
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Cursor should be at the mark position (column 6, row 0)
+    // New content should appear immediately after "Before"
+    term.print("NEW");
+
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &["BeforeNEW", "          ", "          ", "          ", "          "],
+    );
+}

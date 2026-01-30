@@ -141,6 +141,14 @@ pub(crate) struct SavedCursor {
     // TODO: selective_erase when supported
 }
 
+/// A bookmark for ClearToMark functionality.
+/// Stores a stable row index (survives scrollback) and column position.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Bookmark {
+    pub stable_row: crate::StableRowIndex,
+    pub col: usize,
+}
+
 struct ScreenOrAlt {
     /// The primary screen + scrollback
     screen: Screen,
@@ -382,6 +390,10 @@ pub struct TerminalState {
     lost_focus_alerted_seqno: SequenceNo,
     focused: bool,
 
+    /// Bookmark for ClearToMark functionality.
+    /// Stores the cursor position at the time SetMark was called.
+    bookmark: Option<Bookmark>,
+
     /// True if lines should be marked as bidi-enabled, and thus
     /// have the renderer apply the bidi algorithm.
     /// true is equivalent to "implicit" bidi mode as described in
@@ -578,6 +590,7 @@ impl TerminalState {
             lost_focus_seqno: seqno,
             lost_focus_alerted_seqno: seqno,
             focused: true,
+            bookmark: None,
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
@@ -742,6 +755,97 @@ impl TerminalState {
         // order to correctly invalidate the display
         self.increment_seqno();
         self.screen_mut().erase_scrollback();
+    }
+
+    /// Sets a bookmark at the current cursor position.
+    /// The bookmark stores the stable row index (survives scrollback) and column.
+    pub(crate) fn set_bookmark(&mut self) {
+        let stable_row = self.screen().visible_row_to_stable_row(self.cursor.y);
+        log::debug!(
+            "set_bookmark: cursor=({}, {}), stable_row={}",
+            self.cursor.x,
+            self.cursor.y,
+            stable_row
+        );
+        self.bookmark = Some(Bookmark {
+            stable_row,
+            col: self.cursor.x,
+        });
+    }
+
+    /// Clears from the bookmark position to the end of the buffer.
+    /// If no bookmark is set, this is a no-op.
+    /// If the bookmark has been purged from scrollback, clears everything.
+    pub(crate) fn clear_to_bookmark(&mut self) {
+        let bookmark = match self.bookmark.take() {
+            Some(b) => b,
+            None => {
+                log::debug!("clear_to_bookmark: no bookmark set, no-op");
+                return;
+            }
+        };
+
+        log::debug!(
+            "clear_to_bookmark: bookmark=(stable_row={}, col={})",
+            bookmark.stable_row,
+            bookmark.col
+        );
+
+        let seqno = self.seqno;
+
+        // Check if bookmark is still valid
+        match self.screen().stable_row_to_phys(bookmark.stable_row) {
+            None => {
+                // Bookmark has been purged from scrollback.
+                // Clear scrollback and display, move cursor to (0,0).
+                log::debug!("clear_to_bookmark: bookmark purged from scrollback, clearing all");
+                self.erase_in_display(EraseInDisplay::EraseScrollback);
+                self.erase_in_display(EraseInDisplay::EraseDisplay);
+                self.cursor.x = 0;
+                self.cursor.y = 0;
+                self.wrap_next = false;
+            }
+            Some(phys_row) => {
+                // Bookmark is still valid
+                let bidi_mode = self.get_bidi_mode();
+                let pen = self.pen.clone_sgr_only();
+                let physical_rows = self.screen().physical_rows;
+
+                log::debug!(
+                    "clear_to_bookmark: phys_row={}, physical_rows={}, total_lines={}",
+                    phys_row,
+                    physical_rows,
+                    self.screen().scrollback_rows()
+                );
+
+                // Clear from bookmark column to end of buffer
+                self.screen_mut().clear_from_phys_row_to_end(
+                    phys_row,
+                    bookmark.col,
+                    seqno,
+                    pen,
+                    bidi_mode,
+                );
+
+                // Position cursor at the bookmark location
+                let new_total = self.screen().scrollback_rows();
+                let scrollback = new_total.saturating_sub(physical_rows);
+                let visible_row = phys_row.saturating_sub(scrollback) as i64;
+
+                log::debug!(
+                    "clear_to_bookmark: new_total={}, scrollback={}, visible_row={}, cursor=({}, {})",
+                    new_total,
+                    scrollback,
+                    visible_row,
+                    bookmark.col,
+                    visible_row
+                );
+
+                self.cursor.y = visible_row;
+                self.cursor.x = bookmark.col;
+                self.wrap_next = false;
+            }
+        }
     }
 
     /// Returns true if the associated application has enabled any of the

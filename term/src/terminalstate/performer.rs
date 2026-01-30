@@ -853,6 +853,12 @@ impl<'a> Performer<'a> {
                         }
                     }
                 }
+                ITermProprietary::SetMark => {
+                    self.set_bookmark();
+                }
+                ITermProprietary::ClearToMark => {
+                    self.clear_to_bookmark();
+                }
                 _ => {
                     if self.config.log_unknown_escape_sequences() {
                         log::warn!("unhandled iterm2: {:?}", iterm);

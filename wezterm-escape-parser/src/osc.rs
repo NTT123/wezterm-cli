@@ -891,6 +891,8 @@ pub enum Progress {
 pub enum ITermProprietary {
     /// The "Set Mark" command allows you to record a location and then jump back to it later
     SetMark,
+    /// Clear from a previously set mark to the end of the buffer
+    ClearToMark,
     /// To bring iTerm2 to the foreground
     StealFocus,
     /// To erase the scrollback history
@@ -1213,6 +1215,7 @@ impl ITermProprietary {
         }
 
         single!(SetMark, "SetMark");
+        single!(ClearToMark, "ClearToMark");
         single!(StealFocus, "StealFocus");
         single!(ClearScrollback, "ClearScrollback");
         single!(EndCopy, "EndCopy");
@@ -1334,6 +1337,7 @@ impl Display for ITermProprietary {
         use self::ITermProprietary::*;
         match self {
             SetMark => write!(f, "SetMark")?,
+            ClearToMark => write!(f, "ClearToMark")?,
             StealFocus => write!(f, "StealFocus")?,
             ClearScrollback => write!(f, "ClearScrollback")?,
             CurrentDir(s) => write!(f, "CurrentDir={}", s)?,
@@ -1727,6 +1731,11 @@ mod test {
         assert_eq!(
             parse(&["1337", "SetMark"], "\x1b]1337;SetMark\x1b\\"),
             OperatingSystemCommand::ITermProprietary(ITermProprietary::SetMark)
+        );
+
+        assert_eq!(
+            parse(&["1337", "ClearToMark"], "\x1b]1337;ClearToMark\x1b\\"),
+            OperatingSystemCommand::ITermProprietary(ITermProprietary::ClearToMark)
         );
 
         assert_eq!(
