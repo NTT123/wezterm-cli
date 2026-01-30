@@ -774,47 +774,6 @@ impl Screen {
     /// - Clears from `col` to end of line on `phys_row`
     /// - Removes all lines after `phys_row`
     /// - Adds blank lines as needed to maintain `physical_rows`
-    pub fn clear_from_phys_row_to_end(
-        &mut self,
-        phys_row: PhysRowIndex,
-        col: usize,
-        seqno: SequenceNo,
-        blank_attr: CellAttributes,
-        bidi_mode: BidiMode,
-    ) {
-        let physical_cols = self.physical_cols;
-        let physical_rows = self.physical_rows;
-
-        // Clear from col to end of line on phys_row
-        if phys_row < self.lines.len() {
-            let line = self.line_mut(phys_row);
-            line.fill_range(
-                col..physical_cols,
-                &Cell::blank_with_attrs(blank_attr.clone()),
-                seqno,
-            );
-        }
-
-        // Remove all lines after phys_row
-        let lines_to_keep = phys_row + 1;
-        while self.lines.len() > lines_to_keep {
-            self.lines.pop_back();
-        }
-
-        // Calculate how many lines we need for the visible area.
-        // If phys_row is in scrollback, we keep it + need physical_rows more.
-        // If phys_row is in visible area, we need to fill up to physical_rows total visible.
-        let scrollback_lines = lines_to_keep.saturating_sub(physical_rows);
-        let target_total = scrollback_lines + physical_rows;
-
-        // Ensure we have enough lines for the visible area
-        while self.lines.len() < target_total {
-            let mut line = Line::with_width(physical_cols, seqno);
-            bidi_mode.apply_to_line(&mut line, seqno);
-            self.lines.push_back(line);
-        }
-    }
-
     /// ```text
     /// ---------
     /// |

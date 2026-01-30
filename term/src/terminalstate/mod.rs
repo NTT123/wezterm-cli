@@ -142,11 +142,17 @@ pub(crate) struct SavedCursor {
 }
 
 /// A bookmark for ClearToMark functionality.
-/// Stores a stable row index (survives scrollback) and column position.
-#[derive(Debug, Clone, Copy)]
+/// Stores a snapshot of the terminal state (screen buffer, cursor, wrap state)
+/// that can be restored when ClearToMark is called.
 pub(crate) struct Bookmark {
-    pub stable_row: crate::StableRowIndex,
-    pub col: usize,
+    /// Cloned screen buffer (includes all scrollback + visible lines)
+    screen: Screen,
+
+    /// Cursor position at bookmark time
+    cursor: CursorPosition,
+
+    /// Wrap pending state
+    wrap_next: bool,
 }
 
 struct ScreenOrAlt {
@@ -757,25 +763,25 @@ impl TerminalState {
         self.screen_mut().erase_scrollback();
     }
 
-    /// Sets a bookmark at the current cursor position.
-    /// The bookmark stores the stable row index (survives scrollback) and column.
+    /// Sets a bookmark by creating a snapshot of the current screen state.
+    /// The snapshot includes the full screen buffer, cursor position, and wrap state.
     pub(crate) fn set_bookmark(&mut self) {
-        let stable_row = self.screen().visible_row_to_stable_row(self.cursor.y);
         log::debug!(
-            "set_bookmark: cursor=({}, {}), stable_row={}",
+            "set_bookmark: cursor=({}, {}), screen_lines={}",
             self.cursor.x,
             self.cursor.y,
-            stable_row
+            self.screen().scrollback_rows()
         );
+
         self.bookmark = Some(Bookmark {
-            stable_row,
-            col: self.cursor.x,
+            screen: self.screen().clone(),
+            cursor: self.cursor,
+            wrap_next: self.wrap_next,
         });
     }
 
-    /// Clears from the bookmark position to the end of the buffer.
+    /// Restores the screen to the state saved when SetMark was called.
     /// If no bookmark is set, this is a no-op.
-    /// If the bookmark has been purged from scrollback, clears everything.
     pub(crate) fn clear_to_bookmark(&mut self) {
         let bookmark = match self.bookmark.take() {
             Some(b) => b,
@@ -786,66 +792,61 @@ impl TerminalState {
         };
 
         log::debug!(
-            "clear_to_bookmark: bookmark=(stable_row={}, col={})",
-            bookmark.stable_row,
-            bookmark.col
+            "clear_to_bookmark: restoring to cursor=({}, {}), screen_lines={}",
+            bookmark.cursor.x,
+            bookmark.cursor.y,
+            bookmark.screen.scrollback_rows()
         );
 
-        let seqno = self.seqno;
+        // Get current screen dimensions
+        let current_cols = self.screen().physical_cols;
+        let current_rows = self.screen().physical_rows;
+        let current_dpi = self.screen().dpi;
 
-        // Check if bookmark is still valid
-        match self.screen().stable_row_to_phys(bookmark.stable_row) {
-            None => {
-                // Bookmark has been purged from scrollback.
-                // Clear scrollback and display, move cursor to (0,0).
-                log::debug!("clear_to_bookmark: bookmark purged from scrollback, clearing all");
-                self.erase_in_display(EraseInDisplay::EraseScrollback);
-                self.erase_in_display(EraseInDisplay::EraseDisplay);
-                self.cursor.x = 0;
-                self.cursor.y = 0;
-                self.wrap_next = false;
-            }
-            Some(phys_row) => {
-                // Bookmark is still valid
-                let bidi_mode = self.get_bidi_mode();
-                let pen = self.pen.clone_sgr_only();
-                let physical_rows = self.screen().physical_rows;
+        // Restore screen state
+        *self.screen_mut() = bookmark.screen;
 
-                log::debug!(
-                    "clear_to_bookmark: phys_row={}, physical_rows={}, total_lines={}",
-                    phys_row,
-                    physical_rows,
-                    self.screen().scrollback_rows()
-                );
+        // If dimensions changed, rewrap to current size
+        let snapshot_cols = self.screen().physical_cols;
+        let snapshot_rows = self.screen().physical_rows;
+        if snapshot_cols != current_cols || snapshot_rows != current_rows {
+            log::debug!(
+                "clear_to_bookmark: dimensions changed from {}x{} to {}x{}, resizing",
+                snapshot_cols,
+                snapshot_rows,
+                current_cols,
+                current_rows
+            );
 
-                // Clear from bookmark column to end of buffer
-                self.screen_mut().clear_from_phys_row_to_end(
-                    phys_row,
-                    bookmark.col,
-                    seqno,
-                    pen,
-                    bidi_mode,
-                );
-
-                // Position cursor at the bookmark location
-                let new_total = self.screen().scrollback_rows();
-                let scrollback = new_total.saturating_sub(physical_rows);
-                let visible_row = phys_row.saturating_sub(scrollback) as i64;
-
-                log::debug!(
-                    "clear_to_bookmark: new_total={}, scrollback={}, visible_row={}, cursor=({}, {})",
-                    new_total,
-                    scrollback,
-                    visible_row,
-                    bookmark.col,
-                    visible_row
-                );
-
-                self.cursor.y = visible_row;
-                self.cursor.x = bookmark.col;
-                self.wrap_next = false;
-            }
+            let size = TerminalSize {
+                rows: current_rows,
+                cols: current_cols,
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: current_dpi,
+            };
+            let seqno = self.seqno;
+            let is_conpty = self.enable_conpty_quirks;
+            let new_cursor = self.screen_mut().resize(size, bookmark.cursor, seqno, is_conpty);
+            self.cursor = new_cursor;
+        } else {
+            // Restore cursor directly
+            self.cursor = bookmark.cursor;
         }
+
+        // Clamp cursor to valid range
+        self.cursor.y = self.cursor.y.min((current_rows - 1) as i64).max(0);
+        self.cursor.x = self.cursor.x.min(current_cols.saturating_sub(1));
+
+        // Restore wrap state
+        self.wrap_next = bookmark.wrap_next;
+
+        log::debug!(
+            "clear_to_bookmark: restored cursor=({}, {}), screen_lines={}",
+            self.cursor.x,
+            self.cursor.y,
+            self.screen().scrollback_rows()
+        );
     }
 
     /// Returns true if the associated application has enabled any of the

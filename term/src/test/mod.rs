@@ -1376,17 +1376,17 @@ fn test_hyperlinks() {
 
 #[test]
 fn test_set_mark_clear_to_mark_basic() {
-    // Test basic SetMark + ClearToMark functionality
+    // Test basic SetMark + ClearToMark functionality (snapshot-based)
     let mut term = TestTerm::new(5, 10, 0);
 
     // Print some content
     term.print("Before");
-    // Set a mark
+    // Set a mark - snapshots the screen state
     term.print("\x1b]1337;SetMark\x07");
-    // Print more content that should be cleared
+    // Print more content that will be discarded on restore
     term.print("After mark");
 
-    // Verify content before clearing
+    // Verify content before restore
     assert_visible_contents(
         &term,
         file!(),
@@ -1394,28 +1394,16 @@ fn test_set_mark_clear_to_mark_basic() {
         &["BeforeAfte", "r mark", "", "", ""],
     );
 
-    // Clear to mark
+    // Clear to mark - restores the snapshot
     term.print("\x1b]1337;ClearToMark\x07");
 
-    // After clearing, only "Before" should remain
-    // The first line's trailing blanks are pruned, while new lines have full width
-    assert_visible_contents(
-        &term,
-        file!(),
-        line!(),
-        &[
-            "Before",
-            "          ",
-            "          ",
-            "          ",
-            "          ",
-        ],
-    );
+    // After restore, screen is exactly as it was at SetMark time
+    assert_visible_contents(&term, file!(), line!(), &["Before", "", "", "", ""]);
 }
 
 #[test]
 fn test_set_mark_with_newlines() {
-    // Test SetMark with newlines in content
+    // Test SetMark with newlines in content (snapshot-based)
     let mut term = TestTerm::new(5, 10, 10);
 
     term.print("Line 1\r\n");
@@ -1423,24 +1411,11 @@ fn test_set_mark_with_newlines() {
     term.print("Line 2\r\n");
     term.print("Line 3\r\n");
 
-    // Clear to mark
+    // Clear to mark - restores to snapshot state
     term.print("\x1b]1337;ClearToMark\x07");
 
-    // Only "Line 1" should remain (mark was set at start of line 2)
-    // The bookmark is at column 0 of row 2, so "Line 1" is preserved and
-    // the rest is cleared. The first line keeps its trailing blanks pruned.
-    assert_visible_contents(
-        &term,
-        file!(),
-        line!(),
-        &[
-            "Line 1",
-            "          ",
-            "          ",
-            "          ",
-            "          ",
-        ],
-    );
+    // Screen restored to state at SetMark: "Line 1" with cursor at start of line 2
+    assert_visible_contents(&term, file!(), line!(), &["Line 1", "", "", "", ""]);
 }
 
 #[test]
@@ -1459,84 +1434,66 @@ fn test_clear_to_mark_without_mark() {
 
 #[test]
 fn test_set_mark_replacement() {
-    // Test that setting a new mark replaces the old one
+    // Test that setting a new mark replaces the old snapshot
     let mut term = TestTerm::new(5, 10, 0);
 
     term.print("A");
-    term.print("\x1b]1337;SetMark\x07"); // First mark at column 1 (after 'A')
+    term.print("\x1b]1337;SetMark\x07"); // First snapshot with "A"
     term.print("B");
-    term.print("\x1b]1337;SetMark\x07"); // Second mark replaces first, at column 2 (after 'AB')
+    term.print("\x1b]1337;SetMark\x07"); // Second snapshot replaces first, now "AB"
     term.print("C");
 
     term.print("\x1b]1337;ClearToMark\x07");
 
-    // Should clear from second mark (at column 2), so 'AB' remains
-    // Trailing blanks are pruned from the first line
-    assert_visible_contents(
-        &term,
-        file!(),
-        line!(),
-        &["AB", "          ", "          ", "          ", "          "],
-    );
+    // Restores to second snapshot state: "AB" with cursor at column 2
+    assert_visible_contents(&term, file!(), line!(), &["AB", "", "", "", ""]);
 }
 
 #[test]
 fn test_set_mark_with_scrollback() {
-    // Test SetMark when content scrolls into scrollback
+    // Test SetMark when content scrolls into scrollback (snapshot-based)
     let mut term = TestTerm::new(3, 10, 10);
 
     term.print("Line 1\r\n");
-    term.print("\x1b]1337;SetMark\x07");
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot: "Line 1" with cursor on line 2
     term.print("Line 2\r\n");
     term.print("Line 3\r\n");
     term.print("Line 4\r\n");
     term.print("Line 5\r\n");
 
-    // At this point, "Line 1" has scrolled into scrollback
-    // But the mark was set at "Line 2" which may or may not be in view
+    // At this point, content has scrolled but snapshot preserved old state
 
     term.print("\x1b]1337;ClearToMark\x07");
 
-    // Should clear from mark position, keeping "Line 1"
-    // Trailing blanks are pruned from the first line
-    assert_all_contents(
-        &term,
-        file!(),
-        line!(),
-        &["Line 1", "          ", "          "],
-    );
+    // Restores to snapshot: "Line 1" with cursor at start of line 2
+    assert_all_contents(&term, file!(), line!(), &["Line 1", "", ""]);
 }
 
 #[test]
 fn test_clear_to_mark_preserves_scrollback() {
-    // Test that scrollback content BEFORE the mark is preserved after ClearToMark
+    // Test that scrollback content is preserved via snapshot restore
     // Use a small visible area (3 rows) with larger scrollback (20 lines)
     let mut term = TestTerm::new(3, 15, 20);
 
-    // Create scrollback content (lines 1-10 will eventually scroll into scrollback)
+    // Create scrollback content
     for i in 1..=10 {
         term.print(&format!("Scrollback {}\r\n", i));
     }
 
-    // Set a mark after the scrollback content
-    // After printing 10 lines + newlines, cursor is at column 0 of a new line (phys line 10)
+    // Set a mark - snapshots entire screen state including scrollback
     term.print("\x1b]1337;SetMark\x07");
 
-    // Add more content after the mark (this will be cleared)
+    // Add more content after the mark
     term.print("After mark 1\r\n");
     term.print("After mark 2\r\n");
     term.print("After mark 3\r\n");
 
-    // Clear to mark - should preserve all scrollback lines 1-10
+    // Clear to mark - restores to snapshot state
     term.print("\x1b]1337;ClearToMark\x07");
 
-    // Verify all scrollback content is preserved
-    // The mark was set at the beginning of phys line 10 (after "Scrollback 10\r\n")
-    // After clearing:
-    // - Lines 0-9 contain "Scrollback 1-10" (preserved)
-    // - Line 10 is blank (cleared from column 0)
-    // - Total: 11 lines (8 scrollback + 3 visible)
-    // - Visible area shows lines 8-10: "Scrollback 9", "Scrollback 10", blank
+    // Restores exactly to the snapshot state:
+    // - Lines 0-9 contain "Scrollback 1-10"
+    // - Cursor at start of empty line 10
     assert_all_contents(
         &term,
         file!(),
@@ -1552,29 +1509,248 @@ fn test_clear_to_mark_preserves_scrollback() {
             "Scrollback 8",
             "Scrollback 9",
             "Scrollback 10",
-            "               ", // line where mark was set, cleared from col 0
+            "", // cursor position at snapshot time
         ],
     );
 }
 
 #[test]
 fn test_cursor_position_after_clear_to_mark() {
-    // Test that cursor is positioned at the bookmark location after ClearToMark
+    // Test that cursor is restored to snapshot position after ClearToMark
     let mut term = TestTerm::new(5, 10, 0);
 
     term.print("Before");
-    term.print("\x1b]1337;SetMark\x07"); // Mark at column 6 (after "Before")
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot with cursor at column 6
     term.print("After");
     term.print("\x1b]1337;ClearToMark\x07");
 
-    // Cursor should be at the mark position (column 6, row 0)
-    // New content should appear immediately after "Before"
+    // Cursor restored to snapshot position (column 6, row 0)
+    // New content appears at that position
     term.print("NEW");
 
+    assert_visible_contents(&term, file!(), line!(), &["BeforeNEW", "", "", "", ""]);
+}
+
+#[test]
+fn test_bookmark_survives_resize() {
+    // Test that bookmark snapshot survives terminal resize
+    let mut term = TestTerm::new(5, 80, 10);
+
+    // Print content and set mark - snapshots at 80 cols
+    term.print("AAAA");
+    term.print("\x1b]1337;SetMark\x07");
+    term.print("BBBB");
+
+    // Verify content before resize
+    assert_visible_contents(&term, file!(), line!(), &["AAAABBBB", "", "", "", ""]);
+
+    // Resize to narrower width
+    term.resize(TerminalSize {
+        rows: 5,
+        cols: 40,
+        pixel_width: 320,
+        pixel_height: 80,
+        dpi: 0,
+    });
+
+    // Clear to mark - restores snapshot then resizes to current dimensions
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // "AAAA" restored, then adapted to 40-col layout
+    assert_visible_contents(&term, file!(), line!(), &["AAAA", "", "", "", ""]);
+}
+
+#[test]
+fn test_bookmark_wrapped_lines_resize() {
+    // Test bookmark with wrapped lines that then get resized (snapshot-based)
+    let mut term = TestTerm::new(5, 40, 10);
+
+    // Print content that wraps at 40 cols
+    term.print(&"A".repeat(60)); // Wraps to 2 lines at width 40
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot: 60 A's wrapped at 40 cols
+    term.print("After");
+
+    // Verify content before resize - wrapped into 2 lines
     assert_visible_contents(
         &term,
         file!(),
         line!(),
-        &["BeforeNEW", "          ", "          ", "          ", "          "],
+        &[
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // 40 A's
+            "AAAAAAAAAAAAAAAAAAAAAfter",                // 20 A's + "After"
+            "",
+            "",
+            "",
+        ],
+    );
+
+    // Resize to wider - lines unwrap
+    term.resize(TerminalSize {
+        rows: 5,
+        cols: 80,
+        pixel_width: 640,
+        pixel_height: 80,
+        dpi: 0,
+    });
+
+    // Clear to mark - restores 40-col snapshot then resizes to 80 cols
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // 60 A's restored and adapted to 80-col layout (fits on one line)
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &[
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // 60 A's
+            "",
+            "",
+            "",
+            "",
+        ],
+    );
+}
+
+#[test]
+fn test_bookmark_resize_narrower_then_wider() {
+    // Test bookmark snapshot survives multiple terminal resizes
+    let mut term = TestTerm::new(5, 80, 10);
+
+    term.print("LineOne");
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot at 80 cols with "LineOne"
+    term.print("LineTwo");
+
+    // First resize: narrower
+    term.resize(TerminalSize {
+        rows: 5,
+        cols: 10,
+        pixel_width: 80,
+        pixel_height: 80,
+        dpi: 0,
+    });
+
+    // Content wraps: "LineOneLin" / "eTwo"
+    assert_visible_contents(&term, file!(), line!(), &["LineOneLin", "eTwo", "", "", ""]);
+
+    // Second resize: back to wider
+    term.resize(TerminalSize {
+        rows: 5,
+        cols: 80,
+        pixel_width: 640,
+        pixel_height: 80,
+        dpi: 0,
+    });
+
+    // Content unwraps
+    assert_visible_contents(&term, file!(), line!(), &["LineOneLineTwo", "", "", "", ""]);
+
+    // Clear to mark - restores 80-col snapshot (already at 80 cols, no resize needed)
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    assert_visible_contents(&term, file!(), line!(), &["LineOne", "", "", "", ""]);
+}
+
+#[test]
+fn test_bookmark_scrollback_purged() {
+    // Test that bookmark snapshot is preserved even when current scrollback is purged
+    // With snapshot approach, the bookmark contains full screen state from creation time
+    let mut term = TestTerm::new(3, 10, 5); // Small scrollback of 5 lines
+
+    term.print("Line1\r\n");
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot: "Line1" with cursor on line 2
+
+    // Fill scrollback until Line1 would be purged in current screen
+    // With 3 visible rows and 5 scrollback, we have capacity for 8 lines
+    for i in 2..=15 {
+        term.print(&format!("Line{}\r\n", i));
+    }
+
+    // Clear to mark - restores the snapshot (which has "Line1")
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // Snapshot restored: "Line1" with cursor at start of line 2
+    assert_visible_contents(&term, file!(), line!(), &["Line1", "", ""]);
+}
+
+#[test]
+fn test_bookmark_resize_then_scroll() {
+    // Test bookmark snapshot with resize + additional scrolling
+    let mut term = TestTerm::new(5, 80, 20);
+
+    // Print content and snapshot at 80 cols
+    term.print("AAA");
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot: "AAA" with cursor at col 3
+    term.print("BBB\r\n");
+    term.print("CCC\r\n");
+
+    // Resize to narrower width
+    term.resize(TerminalSize {
+        rows: 5,
+        cols: 40,
+        pixel_width: 320,
+        pixel_height: 80,
+        dpi: 0,
+    });
+
+    // Print more content
+    for i in 0..5 {
+        term.print(&format!("Line{}\r\n", i));
+    }
+
+    // Clear to mark - restores 80-col snapshot then resizes to 40 cols
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // "AAA" restored from snapshot and adapted to 40-col layout
+    assert_all_contents(&term, file!(), line!(), &["AAA", "", "", "", ""]);
+}
+
+#[test]
+fn test_bookmark_logical_line_with_multiple_wraps() {
+    // Test bookmark snapshot with wrapped lines that get resized
+    let mut term = TestTerm::new(5, 20, 10);
+
+    // Create a long line that wraps at width 20
+    term.print(&"A".repeat(45)); // Wraps to 3 physical lines at width 20
+    term.print("\x1b]1337;SetMark\x07"); // Snapshot: 45 A's wrapped at 20 cols
+    term.print("AFTER");
+
+    // Verify content before resize
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &[
+            "AAAAAAAAAAAAAAAAAAAA", // 20 A's
+            "AAAAAAAAAAAAAAAAAAAA", // 20 A's
+            "AAAAAAFTER",           // 5 A's + AFTER
+            "",
+            "",
+        ],
+    );
+
+    // Resize to wider
+    term.resize(TerminalSize {
+        rows: 5,
+        cols: 60,
+        pixel_width: 480,
+        pixel_height: 80,
+        dpi: 0,
+    });
+
+    // Clear to mark - restores 20-col snapshot then resizes to 60 cols
+    term.print("\x1b]1337;ClearToMark\x07");
+
+    // 45 A's restored and adapted to 60-col layout (fits on one line)
+    assert_visible_contents(
+        &term,
+        file!(),
+        line!(),
+        &[
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // 45 A's
+            "",
+            "",
+            "",
+            "",
+        ],
     );
 }

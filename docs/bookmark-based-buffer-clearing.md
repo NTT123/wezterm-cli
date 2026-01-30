@@ -4,8 +4,8 @@
 
 This feature implements iTerm2-compatible `SetMark` and `ClearToMark` escape sequences that allow terminal applications to:
 
-1. **Set a bookmark** at the current cursor position
-2. **Clear all content** from that bookmark to the end of the buffer
+1. **Set a bookmark** that snapshots the current screen state
+2. **Restore to that snapshot** when clearing, discarding all changes made since
 
 This is useful for shell integrations and terminal applications that want to clear command output while preserving previous content, similar to the "clear to start of command" functionality in modern shells.
 
@@ -13,57 +13,68 @@ This is useful for shell integrations and terminal applications that want to cle
 
 | Sequence | Description |
 |----------|-------------|
-| `\e]1337;SetMark\a` | Sets a bookmark at the current cursor position |
-| `\e]1337;ClearToMark\a` | Clears from the bookmark to the end of the buffer |
+| `\e]1337;SetMark\a` | Snapshots the current screen state (buffer + cursor) |
+| `\e]1337;ClearToMark\a` | Restores the screen to the saved snapshot |
 
 Both sequences use the OSC (Operating System Command) format with the iTerm2 proprietary prefix `1337`.
 
 ## Design
 
-### Bookmark Storage
+### Screen Snapshot Approach
 
-The bookmark is stored as a `Bookmark` struct containing:
+The bookmark stores a complete snapshot of the terminal state:
 
 ```rust
 struct Bookmark {
-    stable_row: StableRowIndex,  // Row index that survives scrollback
-    col: usize,                   // Column position
+    /// Cloned screen buffer (includes all scrollback + visible lines)
+    screen: Screen,
+
+    /// Cursor position at bookmark time
+    cursor: CursorPosition,
+
+    /// Wrap pending state
+    wrap_next: bool,
 }
 ```
 
 **Key design decisions:**
 
-1. **Stable row index**: Uses `StableRowIndex` instead of physical or visible row index. This ensures the bookmark remains valid even as content scrolls into the scrollback buffer.
+1. **Full state snapshot**: Clones the entire screen buffer, cursor position, and wrap state. This provides a clean "save state / restore state" mechanism.
 
-2. **Single bookmark**: Only one bookmark is stored at a time. Calling `SetMark` multiple times overwrites the previous bookmark.
+2. **Resize handling**: If the terminal was resized between `SetMark` and `ClearToMark`:
+   - The snapshot is restored first
+   - Then resized to the current terminal dimensions
+   - Cursor is clamped to valid range
 
-3. **Bookmark consumption**: `ClearToMark` consumes (removes) the bookmark after use. To clear to the same position again, `SetMark` must be called again.
+3. **Scrollback preservation**: The snapshot contains all scrollback that existed at bookmark time. Even if current scrollback has been purged, restoring brings back the original state.
 
-### Clear Behavior
+4. **Single bookmark**: Only one bookmark is stored at a time. Calling `SetMark` multiple times overwrites the previous snapshot.
+
+5. **Bookmark consumption**: `ClearToMark` consumes (removes) the bookmark after use. To restore to the same state again, `SetMark` must be called again.
+
+### Why Snapshot vs Position-Based
+
+| Aspect | Position-Based | Snapshot-Based |
+|--------|---------------|----------------|
+| Resize handling | Complex recalculation | Just restore then resize |
+| Scrollback purge | Track purged lines | Irrelevant - restore old state |
+| Buffer integrity | Risk of corruption | Clean swap |
+| Code complexity | High | Low |
+| Memory usage | Minimal | Higher (full buffer clone) |
+
+The snapshot approach was chosen for its simplicity and robustness. Memory usage is acceptable for a single bookmark.
+
+### Restore Behavior
 
 When `ClearToMark` is executed:
 
-1. **Bookmark valid**: If the bookmark position still exists in the buffer:
-   - Clear from the bookmark column to end of line on the bookmark row
-   - Remove all lines after the bookmark row
-   - Add blank lines to maintain the visible area size
-   - Position cursor at the bookmark location
+1. **Bookmark exists**:
+   - Restore the saved screen buffer
+   - If dimensions changed, resize to current dimensions
+   - Restore cursor position (clamped to valid range)
+   - Restore wrap state
 
-2. **Bookmark purged**: If the bookmark has been purged from scrollback (due to scrollback limit):
-   - Clear all scrollback
-   - Clear the entire display
-   - Position cursor at (0, 0)
-
-3. **No bookmark set**: If `ClearToMark` is called without a prior `SetMark`:
-   - No-op (does nothing)
-
-### Scrollback Preservation
-
-A critical design requirement is that content **before** the bookmark must be preserved. The implementation ensures:
-
-- All lines from index 0 to the bookmark row are kept intact
-- Only content from the bookmark position onward is cleared
-- The visible area is properly maintained with blank lines after clearing
+2. **No bookmark set**: No-op (does nothing)
 
 ## Implementation
 
@@ -74,7 +85,6 @@ A critical design requirement is that content **before** the bookmark must be pr
 | `wezterm-escape-parser/src/osc.rs` | Parse `SetMark` and `ClearToMark` escape sequences |
 | `term/src/terminalstate/mod.rs` | `Bookmark` struct, `set_bookmark()`, `clear_to_bookmark()` |
 | `term/src/terminalstate/performer.rs` | Wire escape sequences to terminal state methods |
-| `term/src/screen.rs` | `clear_from_phys_row_to_end()` screen operation |
 | `term/src/test/mod.rs` | Comprehensive test suite |
 
 ### Key Functions
@@ -83,15 +93,22 @@ A critical design requirement is that content **before** the bookmark must be pr
 
 ```rust
 pub(crate) fn set_bookmark(&mut self) {
-    let stable_row = self.screen().visible_row_to_stable_row(self.cursor.y);
+    log::debug!(
+        "set_bookmark: cursor=({}, {}), screen_lines={}",
+        self.cursor.x,
+        self.cursor.y,
+        self.screen().scrollback_rows()
+    );
+
     self.bookmark = Some(Bookmark {
-        stable_row,
-        col: self.cursor.x,
+        screen: self.screen().clone(),
+        cursor: self.cursor,
+        wrap_next: self.wrap_next,
     });
 }
 ```
 
-Converts the current visible cursor position to a stable row index and stores it with the column.
+Creates a snapshot of the current screen state by cloning the screen buffer and saving cursor/wrap state.
 
 #### `clear_to_bookmark()` (terminalstate/mod.rs)
 
@@ -102,68 +119,46 @@ pub(crate) fn clear_to_bookmark(&mut self) {
         None => return,  // No-op if no bookmark
     };
 
-    match self.screen().stable_row_to_phys(bookmark.stable_row) {
-        None => {
-            // Bookmark purged - clear everything
-            self.erase_in_display(EraseInDisplay::EraseScrollback);
-            self.erase_in_display(EraseInDisplay::EraseDisplay);
-            self.cursor.x = 0;
-            self.cursor.y = 0;
-        }
-        Some(phys_row) => {
-            // Clear from bookmark to end
-            self.screen_mut().clear_from_phys_row_to_end(...);
+    // Get current screen dimensions
+    let current_cols = self.screen().physical_cols;
+    let current_rows = self.screen().physical_rows;
+    let current_dpi = self.screen().dpi;
 
-            // Position cursor at bookmark location
-            let visible_row = phys_row.saturating_sub(scrollback) as i64;
-            self.cursor.y = visible_row;
-            self.cursor.x = bookmark.col;
-        }
+    // Restore screen state
+    *self.screen_mut() = bookmark.screen;
+
+    // If dimensions changed, rewrap to current size
+    if self.screen().physical_cols != current_cols
+        || self.screen().physical_rows != current_rows
+    {
+        let size = TerminalSize { rows: current_rows, cols: current_cols, ... };
+        let new_cursor = self.screen_mut().resize(size, bookmark.cursor, ...);
+        self.cursor = new_cursor;
+    } else {
+        self.cursor = bookmark.cursor;
     }
+
+    // Clamp cursor to valid range
+    self.cursor.y = self.cursor.y.min((current_rows - 1) as i64).max(0);
+    self.cursor.x = self.cursor.x.min(current_cols.saturating_sub(1));
+
+    self.wrap_next = bookmark.wrap_next;
 }
 ```
 
-#### `clear_from_phys_row_to_end()` (screen.rs)
-
-```rust
-pub fn clear_from_phys_row_to_end(
-    &mut self,
-    phys_row: PhysRowIndex,
-    col: usize,
-    seqno: SequenceNo,
-    blank_attr: CellAttributes,
-    bidi_mode: BidiMode,
-) {
-    // 1. Clear from col to end of line on phys_row
-    // 2. Remove all lines after phys_row
-    // 3. Calculate target line count to maintain visible area
-    // 4. Add blank lines as needed
-}
-```
-
-### Row Index Types
-
-Understanding the different row index types is crucial:
-
-| Type | Description |
-|------|-------------|
-| `VisibleRowIndex` | Row relative to visible area (0 = top of screen) |
-| `PhysRowIndex` | Absolute index into the line buffer |
-| `StableRowIndex` | Monotonically increasing index that survives scrollback |
-
-The bookmark uses `StableRowIndex` for persistence, which is converted to `PhysRowIndex` when clearing.
+Restores the saved snapshot and handles dimension changes.
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-# Set a mark at current position
+# Set a mark (snapshot current state)
 printf '\e]1337;SetMark\a'
 
 # ... do some work ...
 
-# Clear everything from mark to end
+# Restore to the snapshot
 printf '\e]1337;ClearToMark\a'
 ```
 
@@ -174,7 +169,7 @@ A common use case is clearing command output in shell prompts:
 ```bash
 # In your shell's precmd/preexec hooks:
 
-# Before command execution - set mark
+# Before command execution - snapshot the state
 preexec() {
     printf '\e]1337;SetMark\a'
 }
@@ -191,30 +186,30 @@ clear_last_output() {
 # Print some content
 echo "Line 1"
 
-# Set mark before command
+# Snapshot before command
 printf '\e]1337;SetMark\a'
 
 # Run a command with lots of output
 ls -la /
 
-# Clear the ls output, keeping "Line 1"
+# Restore to snapshot, discarding ls output
 printf '\e]1337;ClearToMark\a'
 ```
 
-**Result:** "Line 1" remains visible, `ls` output is cleared, cursor is at the mark position.
+**Result:** Screen is restored to show just "Line 1" with cursor at the mark position.
 
 ### Example: SetMark Override
 
 ```bash
 echo "Line 1"
-printf '\e]1337;SetMark\a'    # First mark
+printf '\e]1337;SetMark\a'    # First snapshot (shows "Line 1")
 echo "Line 2"
-printf '\e]1337;SetMark\a'    # Second mark (replaces first)
+printf '\e]1337;SetMark\a'    # Second snapshot (shows "Line 1" and "Line 2")
 echo "Line 3"
-printf '\e]1337;ClearToMark\a'  # Clears from second mark
+printf '\e]1337;ClearToMark\a'  # Restores to second snapshot
 ```
 
-**Result:** "Line 1" and "Line 2" remain, "Line 3" is cleared.
+**Result:** "Line 1" and "Line 2" are visible, "Line 3" is gone.
 
 ### Example: Scrollback Preservation
 
@@ -222,17 +217,17 @@ printf '\e]1337;ClearToMark\a'  # Clears from second mark
 # Generate scrollback content
 for i in $(seq 1 100); do echo "Scrollback line $i"; done
 
-# Set mark
+# Snapshot (includes all 100 lines)
 printf '\e]1337;SetMark\a'
 
-# Add content to clear
-echo "This will be cleared"
+# Add more content
+echo "This will be discarded"
 echo "This too"
 
-# Clear to mark
+# Restore snapshot
 printf '\e]1337;ClearToMark\a'
 
-# Scroll up - all 100 "Scrollback line N" entries are preserved
+# Scroll up - all 100 "Scrollback line N" entries are restored
 ```
 
 ### Example: Cursor Positioning
@@ -245,23 +240,29 @@ printf '\e]1337;ClearToMark\a'
 echo "New content"
 ```
 
-**Result:** Output is `Before markNew content` - the cursor returns to the mark position.
+**Result:** Output is `Before markNew content` - the cursor returns to the snapshot position.
 
 ## Testing
 
 ### Automated Tests
 
-The implementation includes 7 comprehensive tests in `term/src/test/mod.rs`:
+The implementation includes 13 comprehensive tests in `term/src/test/mod.rs`:
 
 | Test | Description |
 |------|-------------|
-| `test_set_mark_clear_to_mark_basic` | Basic SetMark + ClearToMark functionality |
-| `test_set_mark_with_newlines` | Mark with content spanning multiple lines |
+| `test_set_mark_clear_to_mark_basic` | Basic snapshot and restore |
+| `test_set_mark_with_newlines` | Snapshot with multi-line content |
 | `test_clear_to_mark_without_mark` | ClearToMark without SetMark (no-op) |
-| `test_set_mark_replacement` | Second SetMark replaces first |
-| `test_set_mark_with_scrollback` | Mark survives scrolling into scrollback |
-| `test_clear_to_mark_preserves_scrollback` | Scrollback before mark is preserved |
-| `test_cursor_position_after_clear_to_mark` | Cursor positioned at mark after clear |
+| `test_set_mark_replacement` | Second SetMark replaces first snapshot |
+| `test_set_mark_with_scrollback` | Snapshot includes scrollback content |
+| `test_clear_to_mark_preserves_scrollback` | Scrollback restored from snapshot |
+| `test_cursor_position_after_clear_to_mark` | Cursor restored to snapshot position |
+| `test_bookmark_survives_resize` | Snapshot restored then resized to current dimensions |
+| `test_bookmark_wrapped_lines_resize` | Wrapped content adapts to new dimensions |
+| `test_bookmark_resize_narrower_then_wider` | Multiple resize operations handled |
+| `test_bookmark_scrollback_purged` | Snapshot preserves state even if current scrollback purged |
+| `test_bookmark_resize_then_scroll` | Resize + scroll handled correctly |
+| `test_bookmark_logical_line_with_multiple_wraps` | Long wrapped lines adapt to new width |
 
 Run tests with:
 
@@ -285,17 +286,17 @@ Then run the example commands above to verify behavior.
 The implementation includes debug logging for troubleshooting:
 
 ```
-set_bookmark: cursor=(x, y), stable_row=N
-clear_to_bookmark: bookmark=(stable_row=N, col=M)
-clear_to_bookmark: phys_row=N, physical_rows=M, total_lines=L
-clear_to_bookmark: new_total=N, scrollback=M, visible_row=V, cursor=(x, y)
+set_bookmark: cursor=(x, y), screen_lines=N
+clear_to_bookmark: restoring to cursor=(x, y), screen_lines=N
+clear_to_bookmark: dimensions changed from WxH to WxH, resizing
+clear_to_bookmark: restored cursor=(x, y), screen_lines=N
 ```
 
 Enable debug logging with `RUST_LOG=debug` to see these messages.
 
 ## Compatibility
 
-This implementation is compatible with iTerm2's `SetMark` escape sequence. The `ClearToMark` sequence is a WezTerm extension that provides the clearing functionality.
+This implementation is compatible with iTerm2's `SetMark` escape sequence. The `ClearToMark` sequence is a WezTerm extension that provides the restore functionality.
 
 | Terminal | SetMark | ClearToMark |
 |----------|---------|-------------|
@@ -305,11 +306,19 @@ This implementation is compatible with iTerm2's `SetMark` escape sequence. The `
 ## Edge Cases
 
 1. **No bookmark set**: `ClearToMark` is a no-op
-2. **Bookmark purged from scrollback**: Clears everything, cursor to (0,0)
-3. **Multiple SetMark calls**: Last one wins (overwrites previous)
-4. **Mark at column 0**: Entire line from mark onward is cleared
-5. **Mark mid-line**: Content before mark column is preserved on that line
-6. **Empty buffer after clear**: Visible area filled with blank lines
+2. **Multiple SetMark calls**: Last one wins (overwrites previous snapshot)
+3. **Terminal resized**: Snapshot restored then resized to current dimensions
+4. **Scrollback purged in current screen**: Snapshot still has original state
+5. **Cursor out of bounds after restore**: Clamped to valid range
+
+## Memory Considerations
+
+The snapshot approach clones the entire screen buffer. For a terminal with 10,000 lines of scrollback at 200 columns:
+- ~2M cells x ~16 bytes/cell = ~32MB per snapshot
+
+This is acceptable for a single bookmark. If multiple bookmarks were needed in the future, consider:
+- Limiting scrollback in snapshots
+- Copy-on-write data structures
 
 ## Future Considerations
 
